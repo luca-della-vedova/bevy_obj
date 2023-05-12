@@ -1,16 +1,16 @@
 use anyhow::Result;
 use bevy_asset::{Handle, LoadContext, LoadedAsset};
 use bevy_ecs::world::{FromWorld, World};
-use bevy_hierarchy::BuildWorldChildren;
 use bevy_pbr::{PbrBundle, StandardMaterial};
 use bevy_render::{
     mesh::{Indices, Mesh},
-    prelude::{Color, SpatialBundle},
+    prelude::Color,
     render_resource::PrimitiveTopology,
     renderer::RenderDevice,
     texture::{CompressedImageFormats, Image, ImageType},
 };
 use bevy_scene::Scene;
+use bevy_utils::HashMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -70,7 +70,6 @@ async fn load_texture_image<'a, 'b>(
             .ok_or(ObjError::InvalidImageFile(path.to_path_buf()))?,
     );
     let bytes = load_context.asset_io().load_path(&path).await?;
-    // TODO(luca) confirm value of is_srgb
     let is_srgb = true;
     Ok(Image::from_buffer(
         &bytes,
@@ -88,8 +87,7 @@ async fn load_obj_data<'a, 'b>(
     let asset_io = load_context.asset_io();
     let ctx_path = load_context.path();
     tobj::load_obj_buf_async(&mut bytes, &options, |p| async move {
-        let mut asset_path = ctx_path.to_owned();
-        asset_path.set_file_name(p);
+        let asset_path = ctx_path.with_file_name(p);
         asset_io
             .load_path(&asset_path)
             .await
@@ -101,17 +99,20 @@ async fn load_obj_data<'a, 'b>(
 }
 
 async fn load_mat_texture<'a, 'b>(
-    texture: &String,
+    texture: &Option<String>,
+    texture_handles: &mut HashMap<String, Handle<Image>>,
     load_context: &'a mut LoadContext<'b>,
     supported_compressed_formats: CompressedImageFormats,
 ) -> Result<Option<Handle<Image>>, ObjError> {
-    if !texture.is_empty() {
-        let handle = if load_context.has_labeled_asset(texture) {
-            load_context.get_handle(texture)
+    if let Some(texture) = texture {
+        let handle = if let Some(handle) = texture_handles.get(texture) {
+            handle.clone()
         } else {
             let img =
                 load_texture_image(texture, load_context, supported_compressed_formats).await?;
-            load_context.set_labeled_asset(texture, LoadedAsset::new(img))
+            let handle = load_context.set_labeled_asset(texture, LoadedAsset::new(img));
+            texture_handles.insert(texture.clone(), handle.clone());
+            handle
         };
         Ok(Some(handle))
     } else {
@@ -131,31 +132,34 @@ async fn load_obj_scene<'a, 'b>(
     })?;
 
     let mut mat_handles = Vec::with_capacity(materials.len());
+    let mut texture_handles = HashMap::new();
     for (mat_idx, mat) in materials.into_iter().enumerate() {
-        // TODO(luca) check other material properties
-        let material = StandardMaterial {
-            base_color: Color::rgb(mat.diffuse[0], mat.diffuse[1], mat.diffuse[2]),
+        let mut material = StandardMaterial {
             base_color_texture: load_mat_texture(
                 &mat.diffuse_texture,
+                &mut texture_handles,
                 load_context,
                 supported_compressed_formats,
             )
             .await?,
             normal_map_texture: load_mat_texture(
                 &mat.normal_texture,
+                &mut texture_handles,
                 load_context,
                 supported_compressed_formats,
             )
             .await?,
             ..Default::default()
         };
+        if let Some(color) = mat.diffuse {
+            material.base_color = Color::rgb(color[0], color[1], color[2]);
+        }
         mat_handles.push(
             load_context.set_labeled_asset(&material_label(mat_idx), LoadedAsset::new(material)),
         );
     }
 
     let mut world = World::default();
-    let world_id = world.spawn(SpatialBundle::VISIBLE_IDENTITY).id();
     for (model_idx, model) in models.into_iter().enumerate() {
         let vertex_position: Vec<[f32; 3]> = model
             .mesh
@@ -194,24 +198,15 @@ async fn load_obj_scene<'a, 'b>(
         let mesh_handle =
             load_context.set_labeled_asset(&mesh_label(model_idx), LoadedAsset::new(mesh));
 
-        // Now assign the material
-        let pbr_id = if let Some(mat_id) = model.mesh.material_id {
-            world
-                .spawn(PbrBundle {
-                    mesh: mesh_handle,
-                    material: mat_handles[mat_id].clone(),
-                    ..Default::default()
-                })
-                .id()
-        } else {
-            world
-                .spawn(PbrBundle {
-                    mesh: mesh_handle,
-                    ..Default::default()
-                })
-                .id()
+        let mut pbr_bundle = PbrBundle {
+            mesh: mesh_handle,
+            ..Default::default()
         };
-        world.entity_mut(world_id).push_children(&[pbr_id]);
+        // Now assign the material, if present
+        if let Some(mat_id) = model.mesh.material_id {
+            pbr_bundle.material = mat_handles[mat_id].clone();
+        }
+        world.spawn(pbr_bundle);
     }
 
     Ok(Scene::new(world))
